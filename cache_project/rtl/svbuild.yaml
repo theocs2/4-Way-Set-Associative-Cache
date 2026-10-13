@@ -1,0 +1,4 @@
+top_tb:
+  compile_first:
+    - pkg/types.sv
+    - pkg/cache.sv

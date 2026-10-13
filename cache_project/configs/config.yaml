@@ -1,0 +1,51 @@
+common_simulation: &common_simulation
+  clock_period: 1000 # In picoseconds
+  timeout: 10000000
+  builder: generic
+  arch: rv32i
+
+  vcs_config_enabled: true
+  rvfi_enabled: false
+  binary_compilation_enabled: false
+  sram_compilation_enabled:  false
+
+common_synthesis: &common_synthesis
+  syn_script: dc/synthesis.tcl
+  constraint_file: constraints/default.sdc
+
+  compile_ultra: false
+  ungroup: false
+  gate_clock: false
+  retime: false
+  min_power: false
+  compile_iterations: 0
+
+  power_script: dc/power.tcl
+  scope: tb_wrapper/dut
+
+  lint_awl: lint.awl
+  lint_script: lint.tcl
+
+  dv_script: dc/dv.tcl
+
+top_tb:
+  supported_targets: [compile, sim, audit, verdi, spike, covrep, syn, dv, lint, sram]
+  
+  competition: false
+  pp_cache: false
+
+  sim: 
+    <<: *common_simulation
+    tb_name: top_tb
+    clock_period: 2000
+    builder: generic
+    commit_log_frequency: 200
+    sram_compilation_enabled: true
+  syn:
+    <<: *common_synthesis
+    design_top: cache
+
+    compile_ultra: true
+    ungroup: true
+    gate_clock: true
+  

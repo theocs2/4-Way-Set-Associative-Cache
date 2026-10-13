@@ -1,0 +1,279 @@
+import os
+import sys
+from pathlib import Path
+from typing import List
+
+import yaml
+from rich import print
+from SCons.Script import (
+    ARGUMENTS,
+    Action,
+    Alias,
+    AlwaysBuild,
+    BoolVariable,
+    Clean,
+    COMMAND_LINE_TARGETS,
+    Default,
+    Dir,
+    EnumVariable,
+    Environment,
+    Export,
+    Help,
+    PathVariable,
+    SConscript,
+    Variables,
+    VariantDir,
+)
+
+
+class ArgumentValidator:
+    @staticmethod
+    def require_args(required_names: List[str], *, hint: str = "") -> None:
+        missing = [name for name in required_names if not str(ARGUMENTS.get(name, "")).strip()]
+        if missing:
+            print(f"[bold red][ARGS] ERROR:[/bold red] Missing required argument(s): {', '.join(missing)}")
+            if hint:
+                print(f"[bold cyan]Hint:[/bold cyan] {hint}")
+            sys.exit(1)
+
+
+class ConfigLoader:
+    @staticmethod
+    def load_yaml_config(env, key: str, path: str) -> None:
+        if not os.path.isfile(path):
+            print(
+                f"[bold red][CONF] ERROR:[/bold red] "
+                f"{key.replace('_', ' ').title()} file [cyan]{path}[/cyan] not found.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        with open(path) as f:
+            env[key] = yaml.safe_load(f)
+
+
+class ProfileValidator:
+    ALL_TARGETS = {"compile", "sim", "audit", "verdi", "spike", "covrep", "syn", "power", "dv", "lint", "sram", "sram_cache"}
+
+    SIM_TARGETS = {"compile", "sim", "audit", "verdi", "spike", "covrep"}
+
+    SYN_TARGETS = {"syn", "power", "dv", "lint"}
+
+    @staticmethod
+    def validate_profile(env, profile_name: str, requested_targets: set) -> tuple:
+        profile_cfg = env["FULL_CFG"].get(profile_name)
+
+        if profile_cfg is None:
+            available_profiles = sorted([
+                k for k in env["FULL_CFG"].keys()
+                if k not in ("common_simulation", "common_synthesis")
+            ])
+            print(
+                f"[bold red][ARGS] ERROR:[/bold red] "
+                f"{profile_name} does not have valid configuration in config.yaml"
+            )
+            print(f"[bold yellow][AVAILABLE PROFILES][/bold yellow] {', '.join(available_profiles)}")
+            sys.exit(1)
+
+        supported_targets = profile_cfg.get("supported_targets")
+        if supported_targets is not None:
+            if isinstance(supported_targets, str):
+                supported_targets = {supported_targets}
+            elif isinstance(supported_targets, list):
+                supported_targets = set(supported_targets)
+            else:
+                print(
+                    f"[bold red][ARGS] ERROR:[/bold red] "
+                    f"'supported_targets' in profile '{profile_name}' must be a string or list"
+                )
+                sys.exit(1)
+
+            invalid_targets = supported_targets - ProfileValidator.ALL_TARGETS
+            if invalid_targets:
+                print(
+                    f"[bold red][ARGS] ERROR:[/bold red] "
+                    f"Profile '{profile_name}' has invalid supported_targets: {', '.join(invalid_targets)}"
+                )
+                print(f"[bold yellow][VALID TARGETS][/bold yellow] {', '.join(sorted(ProfileValidator.ALL_TARGETS))}")
+                sys.exit(1)
+
+            unsupported = requested_targets - supported_targets
+            if unsupported:
+                print(
+                    f"[bold red][ARGS] ERROR:[/bold red] "
+                    f"Profile '{profile_name}' does not support target(s): {', '.join(sorted(unsupported))}"
+                )
+                print(f"[bold yellow][SUPPORTED TARGETS][/bold yellow] {', '.join(sorted(supported_targets))}")
+                sys.exit(1)
+
+        sim_cfg = profile_cfg.get("sim")
+        syn_cfg = profile_cfg.get("syn")
+
+        if requested_targets & ProfileValidator.SIM_TARGETS:
+            if sim_cfg is None:
+                print(
+                    f"[bold red][ARGS] ERROR:[/bold red] "
+                    f"Profile '{profile_name}' does not have valid simulation configuration "
+                    f"(required for targets: {', '.join(sorted(requested_targets & ProfileValidator.SIM_TARGETS))})"
+                )
+                sys.exit(1)
+
+        if requested_targets & ProfileValidator.SYN_TARGETS:
+            if syn_cfg is None:
+                print(
+                    f"[bold red][ARGS] ERROR:[/bold red] "
+                    f"Profile '{profile_name}' does not have valid synthesis configuration "
+                    f"(required for targets: {', '.join(sorted(requested_targets & ProfileValidator.SYN_TARGETS))})"
+                )
+                sys.exit(1)
+
+        if sim_cfg is None:
+            sim_cfg = {}
+        if syn_cfg is None:
+            syn_cfg = {}
+
+        return sim_cfg, syn_cfg
+
+
+class EnvironmentSetup:
+    @staticmethod
+    def setup_command_line_options() -> Variables:
+        vars = Variables()
+        vars.Add(EnumVariable("TOOL", "Simulation tool to use", "vcs", allowed_values=["vcs"]))
+        vars.Add("PROFILE", "Profile to use (defaults to top_tb)", default="top_tb")
+        vars.Add(BoolVariable("DUMP_FSDB", "Dump FSDB file", default=True))
+        vars.Add(PathVariable("PROG", "Program to simulate (Required for power)", None, PathVariable.PathIsFile))
+        vars.Add(BoolVariable("RAW", "Use plain, line-by-line tee output instead of the fancy live TTY window", default=True))
+        return vars
+
+    @staticmethod
+    def setup_directory_structure(env, build_root: str) -> None:
+        os.makedirs(build_root, exist_ok=True)
+        env["BUILD_ROOT"] = os.path.abspath(build_root)
+        env["PROJECT_ROOT"] = Dir(".").srcnode().path
+        env["RTL_ROOT"] = os.path.join(env["PROJECT_ROOT"], "rtl")
+        env["TB_ROOT"] = os.path.join(env["PROJECT_ROOT"], "tb")
+        env["SIM_ROOT"] = os.path.join(env["PROJECT_ROOT"], "sim")
+        env["SYN_ROOT"] = os.path.join(env["PROJECT_ROOT"], "syn")
+        env["LINT_ROOT"] = os.path.join(env["PROJECT_ROOT"], "lint")
+        env["SRAM_ROOT"] = os.path.join(env["PROJECT_ROOT"], "sram")
+        env["CONFIG_ROOT"] = os.path.join(env["PROJECT_ROOT"], "configs")
+
+    @staticmethod
+    def setup_synopsys_environment(env) -> None:
+        env["ENV"]["LM_LICENSE_FILE"] = env["TOOL_CONFIG"]["synopsys"]["LM_LICENSE_FILE"]
+        env["ENV"]["VCS_HOME"] = env["TOOL_CONFIG"]["synopsys"]["VCS_HOME"]
+        env["ENV"]["VCS_ARCH_OVERRIDE"] = "linux"
+        env["ENV"]["VERDI_HOME"] = env["TOOL_CONFIG"]["synopsys"]["VERDI_HOME"]
+
+        for p in env["TOOL_CONFIG"]["synopsys"]["BINARY_PATHS"]:
+            env.PrependENVPath("PATH", p)
+
+        for p in env["TOOL_CONFIG"]["synopsys"]["LD_LIBRARY_PATHS"]:
+            env.PrependENVPath("LD_LIBRARY_PATH", p)
+
+
+class BuildTargetManager:
+    @staticmethod
+    def create_target_aliases(targets_dict: dict) -> None:
+        for alias_name, target_node in targets_dict.items():
+            if target_node is not None:
+                Alias(alias_name, target_node)
+
+    @staticmethod
+    def setup_default_target(env):
+        def print_no_target(target, source, env):
+            print("[bold yellow][DEFAULT] No target specified.[/bold yellow]")
+            print("[bold cyan]Available targets: compile, sim, audit, verdi, spike, covrep, syn, power, dv, lint, sram[/bold cyan]")
+            return 0
+
+        default_target = env.Command('__default__', [], Action(print_no_target, cmdstr=None))
+        Default(default_target)
+        AlwaysBuild(default_target)
+        return default_target
+
+
+class CleanupManager:
+    @staticmethod
+    def find_pycache_dirs(root: str = ".") -> List[str]:
+        pycache_dirs = []
+        for dirpath, dirnames, _ in os.walk(root):
+            if "__pycache__" in dirnames:
+                pycache_dirs.append(os.path.join(dirpath, "__pycache__"))
+        return pycache_dirs
+
+    @staticmethod
+    def setup_cleanup(default_target) -> None:
+        pycaches = CleanupManager.find_pycache_dirs(".")
+        Clean(default_target, ['build'] + pycaches)
+
+
+# =============================================================================
+# Main Build Configuration
+# =============================================================================
+
+vars = EnvironmentSetup.setup_command_line_options()
+env = Environment(ENV=os.environ.copy(), variables=vars)
+Help(vars.GenerateHelpText(env))
+
+EnvironmentSetup.setup_directory_structure(env, "build")
+
+if env.get("PROG"):
+    env["PROG"] = env.File(env["PROG"]).get_abspath()
+
+ConfigLoader.load_yaml_config(env, "FULL_CFG", os.path.join(env["CONFIG_ROOT"], "config.yaml"))
+ConfigLoader.load_yaml_config(env, "TOOL_CONFIG", "/class/ece411/configs/tools.yaml")
+
+EnvironmentSetup.setup_synopsys_environment(env)
+
+targets = set(COMMAND_LINE_TARGETS)
+requested_build_targets = targets & ProfileValidator.ALL_TARGETS
+
+if requested_build_targets:
+    sim_cfg, syn_cfg = ProfileValidator.validate_profile(env, env["PROFILE"], requested_build_targets)
+    env["SIM_CFG"] = sim_cfg
+    env["SYN_CFG"] = syn_cfg
+else:
+    env["SIM_CFG"] = {}
+    env["SYN_CFG"] = {}
+
+build_root = env["BUILD_ROOT"]
+VariantDir(os.path.join(build_root, "rtl"), "rtl", duplicate=False)
+VariantDir(os.path.join(build_root, "sim"), "sim", duplicate=False)
+VariantDir(os.path.join(build_root, "syn"), "syn", duplicate=False)
+VariantDir(os.path.join(build_root, "lint"), "lint", duplicate=False)
+VariantDir(os.path.join(build_root, "sram"), "sram", duplicate=False)
+
+if requested_build_targets:
+    Export("env")
+    rtl_sources, rtl_audit = SConscript("rtl/SConscript", exports=["env"])
+    tb_sources = SConscript("tb/SConscript", exports=["env"])
+    sram_target, sram_cache_target = SConscript("sram/SConscript", exports=["env"])
+    sim_target = SConscript("sim/SConscript", exports=["env", "rtl_sources", "rtl_audit", "tb_sources", "sram_target"])
+    syn_target, power_target, dv_target = SConscript("syn/SConscript", exports=["env", "rtl_sources", "rtl_audit", "sim_target", "sram_target"])
+    lint_target = SConscript("lint/SConscript", exports=["env", "rtl_sources", "rtl_audit", "sram_target"])
+else:
+    rtl_sources = None
+    rtl_audit = None
+    tb_sources = None
+    sim_target = None
+    syn_target = None
+    power_target = None
+    dv_target = None
+    lint_target = None
+    sram_target = None
+    sram_cache_target = None
+
+BuildTargetManager.create_target_aliases({
+    "audit": rtl_audit,
+    "syn": syn_target,
+    "power": power_target,
+    "dv": dv_target,
+    "lint": lint_target,
+    "sram": sram_target,
+    "sram_cache": sram_cache_target,
+})
+
+default_target = BuildTargetManager.setup_default_target(env)
+
+CleanupManager.setup_cleanup(default_target)

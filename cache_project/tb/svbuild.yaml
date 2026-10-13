@@ -1,0 +1,5 @@
+top_tb:
+  tb_top: top_tb/top_tb.sv
+  source_dirs:
+    - top_tb/
+    - common/

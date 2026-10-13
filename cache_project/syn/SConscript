@@ -1,0 +1,401 @@
+import os
+import re
+import shutil
+import sys
+from typing import Dict, List, Tuple
+
+from rich import print
+from SCons.Script import Action, Glob, Return, Value
+
+from site_scons.library.helpers import run_and_log
+
+Import('env', 'rtl_sources', 'rtl_audit', 'sim_target', 'sram_target')
+
+
+BUILD_ROOT = env['BUILD_ROOT']
+
+
+class SynthesisConfig:
+    ERROR_CODES = [
+        "error",
+        "LINK-5",
+        "ELAB-974",
+        "ELAB-978",
+        "ELAB-979",
+        "OPT-150",
+        "OPT-314",
+    ]
+
+
+class CompileCommandBuilder:
+    @staticmethod
+    def build_commands(synth_cfg: Dict) -> Tuple[int, int, str, str]:
+        compile_iterations = synth_cfg['compile_iterations']
+
+        if not (0 <= compile_iterations <= 3):
+            print(
+                "[bold red][SYNTH] ERROR:[/bold red] "
+                "Incremental compile iterations must be between 0 and 3",
+                file=sys.stderr,
+            )
+            return 1, 0, "", ""
+
+        compile_ultra = synth_cfg.get("compile_ultra", False)
+        ungroup = synth_cfg.get("ungroup", False)
+        gate_clock = synth_cfg.get("gate_clock", False)
+        retime = synth_cfg.get("retime", False)
+
+        if retime and not compile_ultra:
+            print(
+                "[bold red][SYNTH] ERROR:[/bold red] "
+                "compile (non-ultra) does not support retime",
+                file=sys.stderr,
+            )
+            return 1, 0, "", ""
+
+        if compile_ultra:
+            compile_cmd = "compile_ultra"
+            compile_cmd_inc = "compile_ultra -incremental"
+        else:
+            compile_cmd = "compile"
+            compile_cmd_inc = "compile -incremental_mapping"
+
+        if compile_ultra:
+            if not ungroup:
+                compile_cmd += " -no_autoungroup"
+                compile_cmd_inc += " -no_autoungroup"
+        else:
+            if ungroup:
+                compile_cmd += " -ungroup_all"
+                compile_cmd_inc += " -ungroup_all"
+
+        if gate_clock:
+            compile_cmd += " -gate_clock"
+            compile_cmd_inc += " -gate_clock"
+
+        if retime:
+            compile_cmd += " -retime"
+            compile_cmd_inc += " -retime"
+
+        return 0, compile_iterations, compile_cmd, compile_cmd_inc
+
+
+class SynthesisLogChecker:
+    @staticmethod
+    def check_logs(synth_output_dir: str) -> int:
+        log_path = os.path.join(synth_output_dir, 'synthesis.log')
+        timing_path = os.path.join(synth_output_dir, 'timing.rpt')
+        area_path = os.path.join(synth_output_dir, 'area.rpt')
+
+        if not os.path.isfile(log_path):
+            print(f"[bold red][SYNTH] ERROR:[/bold red] Synthesis log not found at {log_path}")
+            return 1
+
+        error_entries = []
+        warning_entries = []
+
+        with open(log_path, 'r', errors='ignore') as f:
+            for line_no, line in enumerate(f, start=1):
+                lower = line.lower()
+
+                if 'warning' in lower and not any(x in lower for x in ['no warning', '0 warning']):
+                    warning_entries.append((line_no, line.rstrip('\n')))
+
+                for code in SynthesisConfig.ERROR_CODES:
+                    pattern = r'\b' + re.escape(code.lower()) + r'\b'
+                    if re.search(pattern, lower):
+                        error_entries.append((line_no, line.rstrip('\n'), code))
+                        break
+
+        if error_entries:
+            print(f"[bold red][SYNTH] ERROR(S) FOUND in {log_path}[/bold red]")
+            for (line_no, line_text, code) in error_entries:
+                print(f"   -> [red]{code}[/red] @ line {line_no}: {line_text}")
+            return 1
+
+        if not os.path.isfile(timing_path):
+            print(f"[bold red][SYNTH] ERROR:[/bold red] Timing report not found at {timing_path}")
+            return 1
+
+        timing_met = False
+        with open(timing_path, 'r', errors='ignore') as f:
+            for line in f:
+                if 'slack (met)' in line.lower():
+                    timing_met = True
+                    break
+
+        if not timing_met:
+            print(f"[bold red][SYNTH] ERROR:[/bold red] Timing not met: {timing_path}")
+            return 1
+
+        print(f"[bold green][SYNTH] SUCCESS:[/bold green] Timing met: {timing_path}")
+
+        if warning_entries:
+            print(f"[bold yellow][SYNTH] WARNING(S) FOUND in {log_path}[/bold yellow]")
+            for (line_no, line_text) in warning_entries:
+                print(f"   -> [yellow]WARNING[/yellow] @ line {line_no}: {line_text}")
+            return 1
+
+        print(f"[bold green][SYNTH] SUCCESS:[/bold green] Area report: {area_path}")
+        return 0
+
+
+class FileManager:
+    @staticmethod
+    def copy_synth_files(synth_files: Dict[str, Dict[str, str]]) -> None:
+        for file_info in synth_files.values():
+            shutil.copy2(file_info['source'], file_info['target'])
+
+
+def synth_action(target, source, env):
+    print(f"[bold cyan][SYNTH] Running synthesis command[/bold cyan]")
+
+    synth_output_dir = os.path.dirname(str(target[0]))
+    work_dir = os.path.join(synth_output_dir, 'work')
+
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir, ignore_errors=False)
+
+    FileManager.copy_synth_files(_synth_files)
+
+    rc, compile_iterations, compile_cmd, compile_cmd_inc = CompileCommandBuilder.build_commands(
+        env['SYN_CFG']
+    )
+    if rc != 0:
+        return 1
+
+    local_env = env['ENV'].copy()
+    local_env['DC_CORES'] = '4'
+    local_env['DESIGN_TOP'] = env['SYN_CFG']['design_top']
+    local_env['STD_CELL_ALIB'] = env['TOOL_CONFIG']['miscellaneous']['FREEPDK45'] + '/alib'
+    local_env['STD_CELL_LIB'] = env['TOOL_CONFIG']['miscellaneous']['FREEPDK45'] + '/stdcells.db'
+    local_env['SRAM_LIB'] = ' '.join([str(s) for s in [f.abspath for f in Glob(f"{env['BUILD_ROOT']}/sram/**/*.db")]])
+    local_env['RTL_SOURCES'] = ' '.join([str(s) for s in rtl_sources])
+    local_env['CLOCK_PERIOD_PS'] = str(env['SIM_CFG']['clock_period'])
+    local_env['DC_COMPILE_CMD'] = compile_cmd
+    local_env['DC_COMPILE_ITER'] = str(compile_iterations)
+    local_env['DC_COMPILE_CMD_INC'] = compile_cmd_inc
+    local_env['DC_MIN_POWER'] = '1' if env['SYN_CFG']['min_power'] else '0'
+    local_env['SNPSLMD_QUEUE'] = 'true'
+
+    cmd = f"dc_shell -f {_synth_files['syn_script']['target']}"
+    synth_rc = run_and_log(
+        cmd,
+        log_path=os.path.join(synth_output_dir, 'synthesis.log'),
+        env=local_env,
+        cwd=synth_output_dir,
+        simple_output=env.get('RAW'),
+    )
+
+    if synth_rc != 0:
+        print(
+            f"[bold red][SYNTH] ERROR:[/bold red] "
+            f"Synthesis command failed: {os.path.join(synth_output_dir, 'synthesis.log')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"[bold green][SYNTH] SUCCESS:[/bold green] "
+        f"Synthesis command finished: {os.path.join(synth_output_dir, 'synthesis.log')}",
+        file=sys.stderr,
+    )
+
+    return SynthesisLogChecker.check_logs(synth_output_dir)
+
+
+def fsdb_to_saif_action(target, source, env):
+    print(f"[bold cyan][POWER] Running FSDB to SAIF conversion[/bold cyan]")
+
+    saif_output_dir = os.path.dirname(target[0].abspath)
+    fsdb = source[1].abspath
+    time = source[2].abspath
+    log_path = os.path.join(saif_output_dir, 'fsdb2saif.log')
+
+    cmd = (
+        f"fsdb2saif -licqueue {fsdb} "
+        f"-bt $(head -n1 {time})ps "
+        f"-et $(tail -n1 {time})ps "
+        f"-s {env['SYN_CFG']['scope']}"
+    )
+
+    saif_rc = run_and_log(
+        cmd,
+        log_path=log_path,
+        env=env['ENV'],
+        cwd=saif_output_dir,
+        simple_output=env.get('RAW')
+    )
+
+    if saif_rc != 0:
+        print(
+            f"[bold red][POWER] ERROR:[/bold red] "
+            f"FSDB to SAIF conversion failed: {log_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    with open(log_path, 'r', errors='ignore') as logf:
+        log_contents = logf.read()
+        if re.search(r'error', log_contents, re.IGNORECASE):
+            print(
+                f"[bold red][POWER] ERROR:[/bold red] "
+                f"Found 'error' in fsdb2saif log: {log_path}",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(
+        f"[bold green][POWER] SUCCESS:[/bold green] "
+        f"FSDB to SAIF conversion finished: {os.path.join(saif_output_dir, 'fsdb2saif.log')}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def power_analysis_action(target, source, env):
+    print(f"[bold cyan][POWER] Running DC power analysis[/bold cyan]")
+
+    power_output_dir = os.path.dirname(str(target[0]))
+    log_path = os.path.join(power_output_dir, 'power.log')
+
+    shutil.copy2(_synth_files['wrappers_script']['source'], _synth_files['wrappers_script']['target'])
+    shutil.copy2(source[2].abspath, os.path.join(power_output_dir, 'power.tcl'))
+
+    cmd = "dc_shell -f power.tcl"
+
+    local_env = env['ENV'].copy()
+    local_env['SYN_ROOT'] = env['SYN_ROOT']
+    local_env['STD_CELL_LIB'] = env['TOOL_CONFIG']['miscellaneous']['FREEPDK45'] + '/stdcells.db'
+    local_env['SRAM_LIB'] = ' '.join([str(s) for s in [f.abspath for f in Glob(f"{env['BUILD_ROOT']}/sram/**/*.db")]])
+    local_env['PWR_SAIF_FILE'] = 'dump.fsdb.saif'
+    local_env['PWR_SAIF_TOP'] = env['SYN_CFG']['scope']
+    local_env['SNPSLMD_QUEUE'] = 'true'
+
+    power_rc = run_and_log(
+        cmd,
+        log_path=log_path,
+        env=local_env,
+        cwd=power_output_dir,
+        simple_output=env.get('RAW')
+    )
+
+    if power_rc != 0:
+        print(
+            f"[bold red][POWER] ERROR:[/bold red] "
+            f"DC power analysis failed: {log_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    with open(log_path, 'r', errors='ignore') as logf:
+        log_contents = logf.read()
+        if re.search(r'error', log_contents, re.IGNORECASE):
+            print(
+                f"[bold red][POWER] ERROR:[/bold red] "
+                f"Found 'error' in power log: {log_path}",
+                file=sys.stderr,
+            )
+            return 1
+
+    power_hierarchical_rpt = os.path.join(power_output_dir, 'power.rpt')
+    power_flat_rpt = os.path.join(power_output_dir, 'power2.rpt')
+
+    print(
+        f"[bold green][POWER] SUCCESS:[/bold green] "
+        f"DC power analysis finished: {log_path}",
+        file=sys.stderr,
+    )
+    print(f"[bold green][POWER] SUCCESS:[/bold green] Power hierarchical report: {power_hierarchical_rpt}")
+    print(f"[bold green][POWER] SUCCESS:[/bold green] Power flat report: {power_flat_rpt}")
+
+    return 0
+
+
+def design_vision_action(target, source, env):
+    ddc_file = str(env.get("DDC_NODE"))
+
+    if not os.path.exists(ddc_file):
+        print(f"[bold red][DV] ERROR:[/bold red] DDC file not found: {ddc_file}")
+        return 1
+
+    dv_output_dir = os.path.dirname(str(target[0]))
+    shutil.copy2(_synth_files['wrappers_script']['source'], _synth_files['wrappers_script']['target'])
+    shutil.copy2(source[0].abspath, os.path.join(dv_output_dir, 'dv.tcl'))
+
+    timeout = env['TOOL_CONFIG']['synopsys']['GUI_TIMEOUT']
+    std_cell_lib = env['TOOL_CONFIG']['miscellaneous']['FREEPDK45'] + '/stdcells.db'
+    cmd = f"cd {dv_output_dir} && STD_CELL_LIB={std_cell_lib} timeout {timeout} design_vision -f dv.tcl"
+
+    print(f"[bold cyan][DV] Launching DV with {ddc_file}[/bold cyan]")
+
+    return env.Execute(cmd)
+
+
+if set(COMMAND_LINE_TARGETS) & {"syn", "power", "dv"}:
+    output_dir = os.path.join(BUILD_ROOT, 'syn', env['PROFILE'])
+    _synth_files = {
+        'syn_script': {
+            'source': os.path.join(env['SYN_ROOT'], env['SYN_CFG']['syn_script']),
+            'target': os.path.join(output_dir, 'synthesis.tcl'),
+        },
+        'constraint_file': {
+            'source': os.path.join(env['SYN_ROOT'], env['SYN_CFG']['constraint_file']),
+            'target': os.path.join(output_dir, 'constraints.sdc'),
+        },
+        'dc_warn_script': {
+            'source': os.path.join(env['SYN_ROOT'], "dc/dc_warn.tcl"),
+            'target': os.path.join(output_dir, 'dc_warn.tcl'),
+        },
+        'wrappers_script': {
+            'source': os.path.join(env['SYN_ROOT'], "wrappers.tcl"),
+            'target': os.path.join(output_dir, 'wrappers.tcl'),
+        },
+    }
+
+    syn_output = os.path.join(output_dir, 'synth.ddc')
+    syn_files = [file_info['source'] for file_info in _synth_files.values()]
+    syn_target = env.Command(
+        syn_output,
+        [syn_files, rtl_sources, rtl_audit, Value(env["SIM_CFG"]), Value(env["SYN_CFG"]), sram_target],
+        Action(synth_action, cmdstr=None),
+    )
+else:
+    syn_target = None
+
+
+if "power" in set(COMMAND_LINE_TARGETS):
+    tb_name = env['SIM_CFG']['tb_name']
+
+    fsdb_file = os.path.join(BUILD_ROOT, 'sim', 'vcs', tb_name, 'dump.fsdb')
+    time_file = os.path.join(BUILD_ROOT, 'sim', 'vcs', tb_name, 'roi.log')
+    saif_file = os.path.join(BUILD_ROOT, 'syn', tb_name, 'dump.fsdb.saif')
+    power_hierarchical_rpt = os.path.join(BUILD_ROOT, 'syn', tb_name, 'power.rpt')
+
+    saif_target = env.Command(
+        target=saif_file,
+        source=[sim_target, fsdb_file, time_file],
+        action=Action(fsdb_to_saif_action, cmdstr=None),
+    )
+
+    power_target = env.Command(
+        target=power_hierarchical_rpt,
+        source=[saif_target, syn_target, os.path.join(env['SYN_ROOT'], env['SYN_CFG']['power_script'])],
+        action=Action(power_analysis_action, cmdstr=None),
+    )
+else:
+    power_target = None
+
+
+if "dv" in set(COMMAND_LINE_TARGETS):
+    dv_env = env.Clone(DDC_NODE=syn_output)
+    dv_target = dv_env.Command(
+        target=os.path.join(BUILD_ROOT, 'syn', env['PROFILE'], '.always_dv'),
+        source=[os.path.join(env['SYN_ROOT'], env['SYN_CFG']['dv_script'])],
+        action=Action(design_vision_action, cmdstr=None),
+    )
+else:
+    dv_target = None
+
+
+Return('syn_target', 'power_target', 'dv_target')

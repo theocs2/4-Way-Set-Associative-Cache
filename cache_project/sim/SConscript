@@ -1,0 +1,556 @@
+import os
+import string
+import subprocess
+import sys
+from glob import glob
+from typing import Dict
+
+import yaml
+from rich import print
+from SCons.Script import Action, Alias, Exit, File, Return, Value, Builder
+
+from site_scons.library.compiler import BinaryCompiler
+from site_scons.library.helpers import run_and_log
+from vcs.Builder import get_builder
+
+Import("env", "rtl_sources", "rtl_audit", "tb_sources", "sram_target")
+
+
+BUILD_ROOT = env["BUILD_ROOT"]
+SIM_ROOT = env["SIM_ROOT"]
+TB_ROOT = env["TB_ROOT"]
+
+sim_target = None
+
+SPIKE_SO = env["TOOL_CONFIG"]["shared_libs"]["SPIKE_SO"]
+RAMULATOR_SO = env["TOOL_CONFIG"]["shared_libs"]["RAMULATOR_SO"]
+MEMORY_MODEL_SO = env["TOOL_CONFIG"]["shared_libs"]["MEMORY_MODEL_SO"]
+
+
+class RVFIGenerator:
+    RVFI_FIELDS = [
+        "valid", "order", "inst", "rs1_addr", "rs2_addr", "rs1_rdata",
+        "rs2_rdata", "rd_addr", "rd_wdata", "pc_rdata", "pc_wdata",
+        "mem_addr", "mem_rmask", "mem_wmask", "mem_rdata", "mem_wdata",
+    ]
+
+    ALLOWED_CHARS = set(string.ascii_letters + string.digits + "._'[]")
+
+    @staticmethod
+    def generate_reference(target, source, env):
+        sv_name = str(target[0])
+        channels = env["SIM_CFG"].get("rvfi_channels", 1)
+
+        print(f"[bold cyan][CONF] Generating RVFI reference {sv_name}[/bold cyan]")
+
+        required_keys = [
+            f"{field}[{i}]"
+            for i in range(channels)
+            for field in RVFIGenerator.RVFI_FIELDS
+        ]
+
+        if os.path.isfile(sv_name):
+            os.remove(sv_name)
+
+        data = env["RVFI_CFG"]
+
+        missing = set(required_keys) - set(data)
+        if missing:
+            print(
+                f"[bold red][CONF] ERROR:[/bold red] Missing RVFI keys: {missing}",
+                file=sys.stderr,
+            )
+            return 1
+
+        spurious = set(data) - set(required_keys)
+        if spurious:
+            print(
+                f"[bold red][CONF] ERROR:[/bold red] Unexpected RVFI keys: {spurious}",
+                file=sys.stderr,
+            )
+            return 1
+
+        bad_values = [v for v in data.values() if not set(v) <= RVFIGenerator.ALLOWED_CHARS]
+        if bad_values:
+            print(
+                f"[bold red][CONF] ERROR:[/bold red] Illegal characters in RVFI config: {bad_values}",
+                file=sys.stderr,
+            )
+            return 1
+
+        with open(sv_name, "w") as f:
+            f.write("always_comb begin\n")
+            for key, value in sorted(data.items()):
+                f.write(f"    mon_itf.{key} = {value};\n")
+            f.write("end\n")
+
+        return 0
+
+    @staticmethod
+    def generate_monitor(target, source, env):
+        riscv_formal_home = str(source[0])
+        rvfimon_path = str(target[0])
+
+        print(f"[bold cyan][CONF] Generating RVFI monitor {rvfimon_path}[/bold cyan]")
+
+        cmd = [
+            "python3",
+            os.path.join(riscv_formal_home, "monitor", "generate.py"),
+            "-i", "rv32imc",
+            "-a",
+            "-r", "16",
+            "-c", str(env["SIM_CFG"].get("rvfi_channels", 1)),
+        ]
+
+        with open(rvfimon_path, "w") as rvfimon_file:
+            proc = subprocess.Popen(cmd, stdout=rvfimon_file, stderr=subprocess.PIPE)
+            _, stderr = proc.communicate()
+
+        if proc.returncode != 0:
+            print(
+                f"[bold red][CONF] RVFI monitor generation failed:[/bold red] {stderr.decode()}",
+                file=sys.stderr,
+            )
+
+        return proc.returncode
+
+
+class VCSConfigGenerator:
+    ALLOWED_CHARS = set(string.ascii_letters + string.digits + "._")
+
+    @staticmethod
+    def generate_xprop_config(target, source, env):
+        xprop_config_path = str(target[0])
+
+        print(f"[bold cyan][CONF] Generating XPROP configuration {xprop_config_path}[/bold cyan]")
+
+        dw_ips = env["SIM_CFG"].get("dw_ips", [])
+        for name in dw_ips:
+            if not set(name) <= VCSConfigGenerator.ALLOWED_CHARS:
+                print(
+                    f"[bold red][CONF] ERROR:[/bold red] Illegal characters in DW IP name: {name}",
+                    file=sys.stderr
+                )
+                return 1
+
+        with open(os.path.join(SIM_ROOT, "vcs", "xprop.config"), "r") as src:
+            with open(xprop_config_path, "w") as dst:
+                dst.write(src.read())
+                for name in dw_ips:
+                    dst.write(f"module {{ {name} }} {{ xpropOff }};\n")
+
+        return 0
+
+    @staticmethod
+    def generate_messages_config(target, source, env):
+        messages_config_path = str(target[0])
+
+        print(f"[bold cyan][CONF] Generating VCS messages configuration {messages_config_path}[/bold cyan]")
+
+        dw_ips = env["SIM_CFG"].get("dw_ips", [])
+        for name in dw_ips:
+            if not set(name) <= VCSConfigGenerator.ALLOWED_CHARS:
+                print(
+                    f"[bold red][CONF] ERROR:[/bold red] Illegal characters in DW IP name: {name}",
+                    file=sys.stderr
+                )
+                return 1
+
+        with open(os.path.join(SIM_ROOT, "vcs", "messages.config"), "r") as src:
+            with open(messages_config_path, "w") as dst:
+                dst.write(src.read() + "\n")
+                for name in dw_ips:
+                    dst.write(f"{{\n    +lint=none;\n    +module={name};\n}}\n")
+
+        return 0
+
+
+class CompileLogChecker:
+    @staticmethod
+    def check_compile_log(target, source, env):
+        output_dir = os.path.dirname(target[0].abspath)
+        log_path = os.path.join(output_dir, "compile.log")
+        xprop_path = os.path.join(output_dir, "xprop.log")
+
+        error_found = False
+        lint_found = False
+        warning_found = False
+
+        if not os.path.isfile(log_path):
+            print(f"[bold red][ELAB] ERROR:[/bold red] compile.log not found at {log_path}")
+            return 1
+
+        print(f"[bold cyan][ELAB] Checking compile log: {log_path}[/bold cyan]")
+        with open(log_path, "r") as f:
+            for line_num, line in enumerate(f, 1):
+                stripped = line.rstrip()
+                if "Error-" in line:
+                    error_found = True
+                    print(
+                        f"[bold red][ELAB] ERROR:[/bold red] "
+                        f"[cyan]{log_path}:{line_num}:[/cyan] {stripped}"
+                    )
+                elif "Lint-" in line:
+                    lint_found = True
+                    print(
+                        f"[bold magenta][ELAB] LINT:[/bold magenta] "
+                        f"[cyan]{log_path}:{line_num}:[/cyan] {stripped}"
+                    )
+                elif "Warning-" in line:
+                    warning_found = True
+                    print(
+                        f"[bold yellow][ELAB] WARNING:[/bold yellow] "
+                        f"[cyan]{log_path}:{line_num}:[/cyan] {stripped}"
+                    )
+
+        if not (error_found or warning_found or lint_found):
+            print(f"[bold green][ELAB] COMPILE SUCCESS:[/bold green] {log_path}")
+        elif error_found:
+            print(f"[bold red][ELAB] COMPILE ERROR:[/bold red] {log_path}")
+        else:
+            print(f"[bold yellow][ELAB] COMPILE WARNING/LINT:[/bold yellow] {log_path}")
+
+        xprop_failed = False
+        if not os.path.isfile(xprop_path):
+            xprop_failed = True
+            print(f"[bold red][ELAB] XPROP ERROR:[/bold red] xprop.log not found at {xprop_path}")
+        else:
+            print(f"[bold cyan][ELAB] Checking xprop log: {xprop_path}[/bold cyan]")
+            with open(xprop_path, "r") as f:
+                for line_num, line in enumerate(f, 1):
+                    if " NO" in line:
+                        xprop_failed = True
+                        stripped = line.rstrip()
+                        print(
+                            f"[bold red][ELAB] XPROP ERROR:[/bold red] "
+                            f"[cyan]{xprop_path}:{line_num}:[/cyan] {stripped}"
+                        )
+
+        if xprop_failed:
+            print(f"[bold red][ELAB] XPROP ERROR:[/bold red] {xprop_path}")
+        else:
+            print(f"[bold green][ELAB] XPROP SUCCESS:[/bold green] {xprop_path}")
+
+        return 1 if error_found or xprop_failed else 0
+
+
+def generate_binary(target, source, env):
+    output_binary = str(target[0].get_abspath())
+    input_source = str(source[0].get_abspath())
+
+    print(f"[bold cyan][PROG] Generating binary {output_binary} from {input_source}[/bold cyan]")
+
+    if not os.path.isfile(input_source):
+        print(
+            f"[bold red][PROG] ERROR:[/bold red] "
+            f"Input source file {input_source} not found, ensure PROG is set"
+        )
+        return 1
+
+    binary_compiler = BinaryCompiler(env, os.path.dirname(output_binary), input_source, 4)
+    return binary_compiler.generate()
+
+
+def vcs_compile_action(target, source, env):
+    name = os.path.splitext(os.path.basename(str(source[0])))[0]
+    output_dir = os.path.dirname(target[0].abspath)
+    tb = str(source[0])
+
+    builder = get_builder(
+        env["SIM_CFG"].get("builder"),
+        env=env,
+        rtl_sources=rtl_sources,
+        tb_sources=tb_sources,
+        sram_enabled=env["SIM_CFG"].get("sram_compilation_enabled", False)
+    )
+
+    elab_cmd = builder.build_vcs_elab_cmd(name, tb, output_dir)
+
+    print(f"[bold cyan][ELAB] Running VCS compilation for {name}[/bold cyan]")
+    compile_rc = run_and_log(
+        elab_cmd,
+        log_path=os.path.join(output_dir, "compile.log"),
+        env=env["ENV"],
+        cwd=output_dir,
+        simple_output=env.get('RAW')
+    )
+    print(f"[bold cyan][ELAB] Compilation finished for {name}[/bold cyan]")
+
+    log_rc = CompileLogChecker.check_compile_log(target, source, env)
+    if compile_rc or log_rc:
+        return 1
+
+    return 0
+
+
+def vcs_sim_action(target, source, env):
+    name = os.path.splitext(os.path.basename(str(source[0])))[0]
+    output_dir = os.path.dirname(target[0].abspath)
+
+    builder = get_builder(
+        env["SIM_CFG"].get("builder"),
+        env=env,
+        rtl_sources=rtl_sources,
+        tb_sources=tb_sources
+    )
+
+    sim_cmd = builder.build_vcs_sim_cmd(name, output_dir)
+
+    print(f"[bold cyan][SIM] Running simulation for {name}[/bold cyan]")
+    sim_rc = run_and_log(
+        sim_cmd,
+        log_path=os.path.join(output_dir, "simulation.log"),
+        env=env["ENV"],
+        cwd=output_dir,
+        simple_output=env.get('RAW')
+    )
+
+    if sim_rc != 0:
+        print(
+            f"[bold red][SIM] Simulation failed for {name}: "
+            f"{os.path.join(output_dir, 'simulation.log')}[/bold red]"
+        )
+        return 1
+
+    print(
+        f"[bold Green][SIM] Simulation finished for {name}[/bold Green]: "
+        f"{os.path.join(output_dir, 'simulation.log')}"
+    )
+    return 0
+
+
+env.Append(
+    BUILDERS={
+        "BuildRVFIRef": Builder(
+            action=Action(RVFIGenerator.generate_reference, cmdstr=None),
+            suffix=".sv",
+            src_suffix=".yaml",
+        ),
+        "BuildRVFIMon": Builder(
+            action=Action(RVFIGenerator.generate_monitor, cmdstr=None),
+            suffix=".v",
+        ),
+        "BuildXPropConfig": Builder(
+            action=Action(VCSConfigGenerator.generate_xprop_config, cmdstr=None),
+            suffix=".config",
+        ),
+        "BuildVCSMessagesConfig": Builder(
+            action=Action(VCSConfigGenerator.generate_messages_config, cmdstr=None),
+            suffix=".config",
+        ),
+        "BuildBinary": Builder(
+            action=Action(generate_binary, cmdstr=None),
+            suffix=".elf",
+        ),
+    }
+)
+
+
+def build_simulation(name: str, tb: str):
+    output_dir = os.path.join(BUILD_ROOT, "sim", "vcs", name)
+
+    vcs_config_enabled = env["SIM_CFG"].get("vcs_config_enabled", True)
+    rvfi_enabled = env["SIM_CFG"].get("rvfi_enabled", False)
+    binary_enabled = env["SIM_CFG"].get("binary_compilation_enabled", False)
+    sram_enabled = env["SIM_CFG"].get("sram_compilation_enabled", False)
+
+    dependencies = [tb, rtl_sources, rtl_audit]
+
+    if binary_enabled:
+        if env.get("PROG") is None:
+            print(f"[bold red][SIM] ERROR:[/bold red] PROG is not set but binary_compilation_enabled=true")
+            sys.exit(1)
+
+        binary = env.BuildBinary(
+            os.path.join(output_dir, "program.elf"),
+            [File(env.get("PROG")), Value(env["SIM_CFG"].get("arch", "rv32i"))]
+        )
+        dependencies.append(binary)
+
+    if rvfi_enabled:
+        rvfi_sv = env.BuildRVFIRef(
+            os.path.join(output_dir, "rvfi_reference.sv"),
+            Value(env["RVFI_CFG"])
+        )
+        dependencies.append(rvfi_sv)
+
+        rvfimon_v = env.BuildRVFIMon(
+            os.path.join(output_dir, "rvfimon.v"),
+            [Value(env["TOOL_CONFIG"]["miscellaneous"]["RISCV_FORMAL_HOME"]),
+             Value(env["SIM_CFG"].get("rvfi_channels", 1))]
+        )
+        dependencies.append(rvfimon_v)
+
+    if vcs_config_enabled:
+        xprop_config = env.BuildXPropConfig(
+            os.path.join(output_dir, "xprop.config"),
+            [Value(env["SIM_CFG"].get("dw_ips", [])),
+             File(os.path.join(SIM_ROOT, "vcs", "xprop.config"))]
+        )
+        dependencies.append(xprop_config)
+
+        vcs_messages_config = env.BuildVCSMessagesConfig(
+            os.path.join(output_dir, "messages.config"),
+            [Value(env["SIM_CFG"].get("dw_ips", [])),
+             File(os.path.join(SIM_ROOT, "vcs", "messages.config"))]
+        )
+        dependencies.append(vcs_messages_config)
+
+    dependencies.append(Value(env["SIM_CFG"]))
+
+    if sram_enabled:
+        dependencies.append(sram_target)
+
+    compile_target = env.Command(
+        os.path.join(output_dir, name + ".always_compile"), # offload to vcs for dep tracking
+        dependencies,
+        Action(vcs_compile_action, cmdstr=None),
+    )
+
+    sim_target = env.Command(
+        os.path.join(output_dir, name + ".always_simulate"),
+        compile_target,
+        Action(vcs_sim_action, cmdstr=None),
+    )
+
+    fsdb_output = os.path.join(output_dir, "dump.fsdb")
+    env.SideEffect([fsdb_output], sim_target)
+    env.Precious([fsdb_output])
+
+    return (compile_target, sim_target)
+
+def verdi_action(target, source, env):
+    fsdb_file = str(env.get("FSDB_NODE"))
+    verdi_folder = os.path.join(os.path.dirname(fsdb_file), "verdi")
+
+    if not os.path.exists(fsdb_file):
+        print(f"[bold red][VERDI] ERROR:[/bold red] FSDB file not found: {fsdb_file}")
+        return 1
+
+    os.makedirs(verdi_folder, exist_ok=True)
+
+    timeout = env['TOOL_CONFIG']['synopsys']['GUI_TIMEOUT']
+    cmd = f"cd {verdi_folder} && timeout {timeout} verdi -ssf {fsdb_file}"
+
+    print(f"[bold cyan][VERDI] Launching Verdi GUI with {fsdb_file}[/bold cyan]")
+
+    return env.Execute(cmd)
+
+def spike_action(target, source, env):
+    output_dir = os.path.abspath(os.path.dirname(str(target[0])))
+    spike_path = env["TOOL_CONFIG"]["riscv"]["RISCV_SPIKE"]
+    arch = env["SIM_CFG"].get("arch", "rv32i")
+
+    cmd = (
+        f"cd {output_dir} && {spike_path} --isa={arch} "
+        f"-m0xaaaaa000:0x55556000 --log-commits {os.path.join(output_dir, 'program.elf')}"
+    )
+    print(f"[bold cyan][SPIKE] Launching Spike with {os.path.join(output_dir, 'program.elf')} in {output_dir}[/bold cyan]")
+
+    spike_log_path = os.path.join(output_dir, "spike.log")
+
+    run_and_log(
+        cmd,
+        log_path=spike_log_path,
+        env=env["ENV"],
+        cwd=output_dir,
+        simple_output=env.get('RAW')
+    )
+
+    with open(spike_log_path, "r") as f:
+        lines = f.readlines()
+    with open(spike_log_path, "w") as f:
+        f.writelines(lines[5:])
+
+    print(f"[bold cyan][SPIKE] Spike finished: {spike_log_path}[/bold cyan]")
+    return 0
+
+def covrep_action(target, source, env):
+    output_dir = os.path.abspath(os.path.dirname(str(target[0])))
+    requested_tb = env["SIM_CFG"].get("tb_name")
+    vdb_dir = os.path.join(output_dir, f"{requested_tb}.vdb")
+
+    if not os.path.exists(vdb_dir):
+        print(f"[bold red][COVREP] ERROR:[/bold red] VDB directory not found: {vdb_dir}, ensure sim target has been run")
+        return 1
+
+    cmd = f"cd {output_dir} && urg -dir {vdb_dir}"
+    print(f"[bold cyan][COVREP] Running covrep for {vdb_dir}[/bold cyan]")
+    rc = run_and_log(
+        cmd,
+        log_path=os.path.join(output_dir, "covrep.log"),
+        env=env["ENV"],
+        cwd=output_dir,
+        simple_output=env.get('RAW')
+    )
+
+    if rc != 0:
+        print(f"[bold red][COVREP] ERROR:[/bold red] Covrep failed: {os.path.join(output_dir, 'covrep.log')}")
+        return 1
+
+    print(f"[bold green][COVREP] SUCCESS:[/bold green] Covrep finished: {os.path.join(output_dir, 'urgReport/dashboard.html')}")
+    return rc
+
+if set(COMMAND_LINE_TARGETS) & {"compile", "sim", "power", "verdi", "spike", "covrep"}:
+    requested_tb = env["SIM_CFG"].get("tb_name")
+    output_dir = os.path.join(BUILD_ROOT, "sim", "vcs", requested_tb)
+    if requested_tb is None:
+        print(f"[bold red][SIM] ERROR:[/bold red] tb_name is not set in the configuration")
+        sys.exit(1)
+
+    tb_file = tb_sources["tb_name_to_file"].get(requested_tb)
+    if tb_file is None:
+        available_tbs = tb_sources["testbenches"]
+        print(
+            f"[bold red][SIM] ERROR:[/bold red] Unknown testbench name '{requested_tb}'.",
+            file=sys.stderr
+        )
+        print(
+            f"[bold red][SIM] Known testbenches:[/bold red] {', '.join(sorted(available_tbs))}",
+            file=sys.stderr
+        )
+        Exit(1)
+
+    compile_target, sim_target = build_simulation(requested_tb, tb_file)
+    Alias("sim", sim_target)
+    Alias("compile", compile_target)
+    
+
+    fsdb_file = os.path.abspath(os.path.join(output_dir, "dump.fsdb"))
+    verdi_env = env.Clone(FSDB_NODE=fsdb_file)
+    verdi_target = verdi_env.Command(
+        target=os.path.join(output_dir, ".verdi_invoked"),
+        source=[],
+        action=Action(verdi_action, cmdstr=None),
+    )
+    Alias("verdi", verdi_target)
+
+
+    spike_dependencies = []
+    if env["SIM_CFG"].get("binary_compilation_enabled", False):
+        if env.get("PROG") is None:
+            print(f"[bold red][SIM] ERROR:[/bold red] PROG is not set but binary_compilation_enabled=true")
+            sys.exit(1)
+
+        binary = env.BuildBinary(
+            os.path.join(output_dir, "program.elf"),
+            [File(env.get("PROG")), Value(env["SIM_CFG"].get("arch", "rv32i"))]
+        )
+        spike_dependencies.append(binary)
+        
+    spike_target = env.Command(
+        target=os.path.abspath(os.path.join(output_dir, "spike.log")),
+        source=spike_dependencies,
+        action=Action(spike_action, cmdstr=None),
+    )
+    Alias("spike", spike_target)
+
+    covrep_target = env.Command(
+        target=os.path.abspath(os.path.join(output_dir, "covrep.log")),
+        source=glob(os.path.join(output_dir, f"{requested_tb}.vdb", "**/*"), recursive=True),
+        action=Action(covrep_action, cmdstr=None),
+    )
+    Alias("covrep", covrep_target)
+
+
+Return("sim_target")

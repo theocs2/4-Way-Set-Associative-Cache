@@ -1,0 +1,396 @@
+import os
+import time
+import random
+import yaml
+import hashlib
+import json
+import textwrap
+import sys
+import shutil
+import string
+from pathlib import Path
+from rich import print
+from site_scons.library.helpers import run_and_log
+
+Import('env')
+
+GLOBAL_CACHE_ROOT = env["TOOL_CONFIG"]["sram"]["SRAM_GLOBAL_CACHE"]
+SRAM_OUTPUT_ROOT = os.path.join(env["BUILD_ROOT"], "sram")
+SRAM_ROOT = env["SRAM_ROOT"]
+
+
+def compute_config_hash(config_path):
+    with open(config_path, 'r') as f:
+        config_data = yaml.safe_load(f)
+    config_str = json.dumps(config_data, sort_keys=True)
+    return hashlib.sha256(config_str.encode()).hexdigest()[:16]
+
+def load_cache_index(cache_file):
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            return json.load(f)
+    return {}
+
+def generate_cache_id():
+    timestamp = int(time.time() * 1000)
+    random_part = random.randint(1000, 9999)
+    return f"sram_{timestamp}_{random_part}"
+
+def save_cache_index(cache_file, cache_index):
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    with open(cache_file, 'w') as f:
+        json.dump(cache_index, indent=2, fp=f)
+
+def copy_from_global_cache(cache_id, local_output_dir, local_name):
+    global_sram_dir = os.path.join(GLOBAL_CACHE_ROOT, cache_id)
+
+    if not os.path.exists(global_sram_dir):
+        return False
+
+    os.makedirs(local_output_dir, exist_ok=True)
+    
+    try:
+        for item in os.listdir(global_sram_dir):
+            src = os.path.join(global_sram_dir, item)
+
+            if os.path.isfile(src):
+                dst_item = item.replace(cache_id, local_name)
+                dst = os.path.join(local_output_dir, dst_item)
+                shutil.copy2(src, dst)
+    except Exception as e:
+        print(f"[bold red][SRAM] ERROR:[/bold red] Failed to copy from global cache: {e}")
+        return False
+
+    with open(os.path.join(local_output_dir, f"{local_name}_TT_1p0V_25C.lib"), "r", encoding="utf-8") as f:
+        data = f.read()
+    data = data.replace(cache_id, local_name)
+    with open(os.path.join(local_output_dir, f"{local_name}_TT_1p0V_25C.lib"), "w", encoding="utf-8") as f:
+        f.write(data)
+
+    with open(os.path.join(local_output_dir, f"{local_name}.v"), "r", encoding="utf-8") as f:
+        data = f.read()
+    data = data.replace(cache_id, local_name)
+    with open(os.path.join(local_output_dir, f"{local_name}.v"), "w", encoding="utf-8") as f:
+        f.write(data)
+
+    cmd = (
+        "LD_PRELOAD=\"/lib64/libk5crypto.so.3 /lib64/libtinfo.so.5\" "
+        "lc_shell -x 'read_lib {lib_file}; write_lib {lib_name}; exit'"
+    ).format(
+        lib_file=os.path.join(local_output_dir, f"{local_name}_TT_1p0V_25C.lib"),
+        lib_name=f"{local_name}_TT_1p0V_25C_lib"
+    )
+    rc = run_and_log(
+        cmd,
+        log_path=os.path.join(local_output_dir, "liberty.log"),
+        shell=True,
+        env=env['ENV'],
+        cwd=local_output_dir,
+        lines=8,
+        fps=60,
+        simple_output=env.get('RAW')
+    )
+    if rc != 0:
+        print(f"[bold red][SRAM] ERROR:[/bold red] Failed to compile liberty file: {os.path.join(local_output_dir, 'liberty.log')}")
+        sys.exit(1)
+
+    keep_files = {
+        f"{local_name}.v",
+        f"{local_name}_TT_1p0V_25C_lib.db",
+        f"{local_name}.html"
+    }
+
+    for item in os.listdir(local_output_dir):
+        item_path = os.path.join(local_output_dir, item)
+        if item not in keep_files:
+            if os.path.isfile(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+    
+    return True
+
+def generate_opensram_config(config_path, output_dir, name, config_data):
+    write_size = config_data.get("write_size", config_data["word_size"])
+
+    allowed_char = set(string.ascii_lowercase + string.ascii_uppercase + string.digits + "._")
+
+    if not set(name) <= allowed_char:
+        print(f"[bold red][SRAM] ERROR:[/bold red] Illegal characters in SRAM name: {name}")
+        sys.exit(1)
+
+    opensram_config = textwrap.dedent(f'''
+        tech_name = "freepdk45"
+        num_rw_ports = {int(config_data["num_rw_ports"])}
+        num_r_ports = {int(config_data["num_r_ports"])}
+        num_w_ports = {int(config_data["num_w_ports"])}
+        word_size = {int(config_data["word_size"])}
+        write_size = {"None" if config_data["word_size"] == write_size else int(write_size)}
+        num_words = {int(config_data["num_words"])}
+        sim_random_init = False
+        nominal_corner_only = True
+        process_corners = ["TT"]
+        supply_voltages = [1.0]
+        temperatures = [25]
+        netlist_only = False
+        route_supplies = False
+        check_lvsdrc = False
+        perimeter_pins = False
+        load_scales = [0.5, 1, 4]
+        slew_scales = [0.5, 1]
+        output_name = "{name}"
+        output_path = "{output_dir}"
+        print_banner = False
+        num_threads = 4
+        output_extended_config = True
+    ''').lstrip()
+
+    config_file = os.path.join(output_dir, f"{name}.py")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(config_file, 'w') as f:
+        f.write(opensram_config)
+
+    return config_file
+
+def run_opensram(config_file, output_dir):
+    CONDA_HOME = env["TOOL_CONFIG"]["sram"]["CONDA_HOME"]
+    OPENRAM_HOME = env["TOOL_CONFIG"]["sram"]["OPENRAM_HOME"]
+    OPENRAM_TECH = env["TOOL_CONFIG"]["sram"]["OPENRAM_TECH"]
+    PYTHONPATH = OPENRAM_HOME
+
+    cmd = (
+        "source {CONDA_HOME}/bin/activate ; "
+        "python3 {OPENRAM_HOME}/../sram_compiler.py {config_file} "
+    ).format(
+        CONDA_HOME=CONDA_HOME,
+        OPENRAM_HOME=OPENRAM_HOME,
+        config_file=config_file
+    )
+
+    local_env = env['ENV'].copy()
+    local_env['CONDA_HOME'] = CONDA_HOME
+    local_env['OPENRAM_HOME'] = OPENRAM_HOME
+    local_env['OPENRAM_TECH'] = OPENRAM_TECH
+    local_env['PYTHONPATH'] = PYTHONPATH
+
+    rc = run_and_log(
+        cmd,
+        log_path=os.path.join(output_dir, "opensram.log"),
+        shell=True,
+        env=local_env,
+        cwd=output_dir,
+        lines=8,
+        fps=60,
+        simple_output=env.get('RAW')
+    )
+    if rc != 0:
+        print(f"[bold red][SRAM] ERROR:[/bold red] Failed to run OpenRAM: {os.path.join(output_dir, 'opensram.log')}")
+        sys.exit(1)
+
+    name = os.path.basename(config_file).replace('.py', '')
+    lib_file = os.path.join(output_dir, f"{name}_TT_1p0V_25C.lib")
+
+    cmd = (
+        "source {CONDA_HOME}/bin/activate ; "
+        "python3 {AREA_PY} {gds_file} > {area_log}"
+    ).format(
+        CONDA_HOME=CONDA_HOME,
+        AREA_PY=os.path.join(SRAM_ROOT, "area.py"),
+        gds_file=os.path.join(output_dir, f"{name}.gds"),
+        area_log=os.path.join(output_dir, f"{name}.area.txt")
+    )
+    rc = run_and_log(
+        cmd,
+        log_path=os.path.join(output_dir, "area.log"),
+        shell=True,
+        env=local_env,
+        cwd=output_dir,
+        lines=8,
+        fps=60,
+        simple_output=env.get('RAW')
+    )
+    if rc != 0:
+        print(f"[bold red][SRAM] ERROR:[/bold red] Failed to extract area: {os.path.join(output_dir, 'area.log')}")
+        sys.exit(1)
+
+    area_file = os.path.join(output_dir, f"{name}.area.txt")
+    if os.path.exists(lib_file):
+        with open(lib_file, 'r') as f:
+            content = f.read()
+        content = content.replace('falling_edge', 'rising_edge')
+
+        if os.path.exists(area_file):
+            with open(area_file, 'r') as f:
+                gds_area = f.read().strip()
+
+            import re
+            content = re.sub(r'area\s*:\s*[\d.]+;', f'area : {gds_area};', content)
+
+        with open(lib_file, 'w') as f:
+            f.write(content)
+
+    cmd = (
+        "LD_PRELOAD=\"/lib64/libk5crypto.so.3 /lib64/libtinfo.so.5\" "
+        "lc_shell -x 'read_lib {lib_file}; write_lib {lib_name}; exit'"
+    ).format(
+        lib_file=lib_file,
+        lib_name=f"{name}_TT_1p0V_25C_lib"
+    )
+    rc = run_and_log(
+        cmd,
+        log_path=os.path.join(output_dir, "liberty.log"),
+        shell=True,
+        env=local_env,
+        cwd=output_dir,
+        lines=8,
+        fps=60,
+        simple_output=env.get('RAW')
+    )
+    if rc != 0:
+        print(f"[bold red][SRAM] ERROR:[/bold red] Failed to compile liberty file: {os.path.join(output_dir, 'liberty.log')}")
+        sys.exit(1)
+
+    keep_files = {
+        f"{name}.v",
+        f"{name}_TT_1p0V_25C.lib",
+        f"{name}_TT_1p0V_25C_lib.db",
+        f"{name}.html"
+    }
+
+    for item in os.listdir(output_dir):
+        item_path = os.path.join(output_dir, item)
+        if item not in keep_files:
+            if os.path.isfile(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+
+def sram_generate_action(target, source, env):
+    sram_root = env["SRAM_ROOT"]
+
+    global_cache_file = os.path.join(GLOBAL_CACHE_ROOT, ".cache_index.json")
+    global_cache_index = load_cache_index(global_cache_file)
+
+    yaml_files = list(Path(sram_root).glob("*.yaml"))
+    if not yaml_files:
+        print("[bold green][SRAM] SUCCESS:[/bold green] No YAML config files found in sram")
+        return 0
+
+    print(f"[bold cyan][SRAM][/bold cyan] [bold blue]Processing {len(yaml_files)} config(s)...")
+
+    generated_count = 0
+    cached_count = 0
+
+    for yaml_path in yaml_files:
+        name = yaml_path.stem
+        config_hash = compute_config_hash(str(yaml_path))
+        local_output_dir = os.path.join(SRAM_OUTPUT_ROOT, name)
+
+        if config_hash in global_cache_index:
+            cache_id = global_cache_index[config_hash]
+            if copy_from_global_cache(cache_id, local_output_dir, name):
+                print(f"[bold green][SRAM][/bold green] Using global cache for [cyan]{name}[/cyan] (cache: [dim]{cache_id}[/dim])")
+                cached_count += 1
+                continue
+            else:
+                print(f"[bold yellow][SRAM] WARNING:[/bold yellow] Global cache entry exists but files missing for [cyan]{name}[/cyan]")
+
+        print(f"[bold cyan][SRAM][/bold cyan] Generating artifacts for [cyan]{name}[/cyan]")
+
+        with open(yaml_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+
+        print(f"[bold cyan][SRAM][/bold cyan] Running local OpenRAM generation for: [cyan]{name}[/cyan]")
+
+        config_file = generate_opensram_config(str(yaml_path), local_output_dir, name, config_data)
+        run_opensram(config_file, local_output_dir)
+
+        generated_count += 1
+
+    print(f"[bold green][SRAM] SUCCESS:[/bold green] {generated_count} generated, {cached_count} cached")
+
+    target_file = str(target[0])
+    with open(target_file, 'w') as f:
+        f.write(f"# SRAM generation completed\n")
+        f.write(f"# Generated: {generated_count}, Cached: {cached_count}\n")
+
+    return 0
+
+def sram_cache_generate_action(target, source, env):
+    global_cache_file = os.path.join(GLOBAL_CACHE_ROOT, ".cache_index.json")
+    global_cache_index = load_cache_index(global_cache_file)
+
+    yaml_files = list(Path(env["SRAM_ROOT"]).glob("*.yaml"))
+    if not yaml_files:
+        print("[bold green][SRAM] SUCCESS:[/bold green] No YAML config files found in sram")
+        return 0
+
+    print(f"[bold cyan][SRAM][/bold cyan] [bold blue]Processing {len(yaml_files)} config(s)...")
+
+    new_global_cache_index = global_cache_index.copy()
+    generated_count = 0
+    cached_count = 0
+
+    for yaml_path in yaml_files:
+        name = yaml_path.stem
+        config_hash = compute_config_hash(str(yaml_path))
+        local_output_dir = os.path.join(SRAM_OUTPUT_ROOT, name)
+
+        if config_hash in global_cache_index:
+            cache_id = global_cache_index[config_hash]
+            print(f"[bold green][SRAM][/bold green] Using global cache for [cyan]{name}[/cyan] (cache: [dim]{cache_id}[/dim])")
+            cached_count += 1
+            continue
+
+        print(f"[bold cyan][SRAM][/bold cyan] Generating artifacts for [cyan]{name}[/cyan]")
+
+        with open(yaml_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+
+        cache_id = generate_cache_id()
+        output_dir = os.path.join(SRAM_OUTPUT_ROOT, cache_id)
+        print(f"[bold cyan][SRAM][/bold cyan] Running local OpenRAM generation for: [cyan]{name}[/cyan] (cache: [dim]{cache_id}[/dim])")
+
+        config_file = generate_opensram_config(str(yaml_path), output_dir, cache_id, config_data)
+        run_opensram(config_file, output_dir)
+        os.remove(os.path.join(SRAM_OUTPUT_ROOT, cache_id, f"{cache_id}_TT_1p0V_25C_lib.db"))
+        
+        keep_files = {
+            f"{cache_id}.v",
+            f"{cache_id}_TT_1p0V_25C.lib",
+            f"{cache_id}.html"
+        }
+
+        global_sram_dir = os.path.join(GLOBAL_CACHE_ROOT, cache_id)
+        os.makedirs(global_sram_dir, exist_ok=True)
+
+        for file_name in keep_files:
+            src = os.path.join(output_dir, file_name)
+            dst = os.path.join(global_sram_dir, file_name)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+            else:
+                print(f"[bold yellow][SRAM] WARNING:[/bold yellow] Expected file not found: {src}")
+
+        new_global_cache_index[config_hash] = cache_id
+        generated_count += 1
+
+    save_cache_index(global_cache_file, new_global_cache_index)
+
+    print(f"[bold green][SRAM] SUCCESS:[/bold green] {generated_count} generated, {cached_count} cached")
+    return 0
+
+
+sram_target = env.Command(
+    target=os.path.join(SRAM_OUTPUT_ROOT, ".sram.stamp"),
+    source=env.Glob(os.path.join(env["SRAM_ROOT"], "*.yaml")),
+    action=Action(sram_generate_action, cmdstr=None)
+)
+sram_cache_target = env.Command(
+    target=os.path.join(GLOBAL_CACHE_ROOT, ".sram_cache_ready"),
+    source=env.Glob(os.path.join(env["SRAM_ROOT"], "*.yaml")),
+    action=Action(sram_cache_generate_action, cmdstr=None)
+)
+
+env.AlwaysBuild(sram_cache_target)
+Return("sram_target", "sram_cache_target")

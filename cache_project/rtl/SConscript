@@ -1,0 +1,372 @@
+import os
+import re
+import sys
+from glob import glob
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import yaml
+from rich import print
+from SCons.Script import Action, Return, Value
+
+Import("env")
+
+
+class SystemVerilogRules:
+    ALLOWED_SYSTEM_TASKS = [
+        'signed', 'unsigned', 'cast',
+        'bits',
+        'unpacked_dimensions', 'dimensions', 'left', 'right', 'low', 'high',
+        'increment', 'size',
+        'clog2',
+        'countbits', 'countones', 'onehot', 'onehot0',
+    ]
+
+    BANNED_SYSTEM_TASKS = [
+        'timeunit', 'timeprecision', 'printtimescale', 'timeformat',
+        'bitstoreal', 'realtobits', 'bitstoshortreal', 'shortrealtobits',
+        'itor', 'rtoi',
+        'isunbounded', 'typename',
+        'asin', 'ln', 'acos', 'log10', 'atan', 'exp', 'atan2', 'sqrt',
+        'hypot', 'pow', 'sinh', 'floor', 'cosh', 'ceil', 'tanh', 'sin',
+        'asinh', 'cos', 'acosh', 'tan', 'atanh',
+        'asserton', 'assertoff', 'assertkill', 'assertcontrol',
+        'assertpasson', 'assertpassoff', 'assertfailon', 'assertfailoff',
+        'assertnonvacuouson', 'assertvacuousoff',
+        'coverage_control', 'coverage_get_max', 'coverage_get',
+        'coverage_merge', 'coverage_save', 'get_coverage',
+        'set_coverage_db_name', 'load_coverage_db',
+        'q_initialize', 'q_add', 'q_remove', 'q_full', 'q_exam',
+        'async', 'sync',
+        'system', 'stacktrace',
+        'dumpfile', 'dumpvars', 'dumpoff', 'dumpon', 'dumpall', 'dumplimit',
+        'dumpflush', 'dumpports', 'dumpportsoff', 'dumpportson',
+        'dumpportsall', 'dumpportslimit', 'dumpportsflush',
+    ]
+
+    LOCAL_ALLOWED_SYSTEM_TASKS = [
+        'finish', 'stop', 'exit',
+        'realtime', 'stime', 'time',
+        'isunknown',
+        'fatal', 'error', 'warning', 'info',
+        'sampled', 'rose', 'fell', 'stable', 'changed', 'past', 'past_gclk',
+        'rose_gclk', 'fell_gclk', 'stable_gclk', 'changed_gclk',
+        'future_gclk', 'rising_gclk', 'falling_gclk', 'steady_gclk',
+        'changing_gclk',
+        'random', 'dist_chi_square', 'dist_erlang', 'dist_exponential',
+        'dist_normal', 'dist_poisson', 'dist_t', 'dist_uniform',
+        'display', 'write', 'displayb', 'writeb', 'displayh', 'writeh',
+        'displayo', 'writeo', 'strobe', 'monitor', 'strobeb', 'monitorb',
+        'strobeh', 'monitorh', 'strobeo', 'monitoro', 'monitoroff',
+        'monitoron',
+        'fclose', 'fopen', 'fdisplay', 'fwrite', 'fdisplayb', 'fwriteb',
+        'fdisplayh', 'fwriteh', 'fdisplayo', 'fwriteo', 'fstrobe',
+        'fmonitor', 'fstrobeb', 'fmonitorb', 'fstrobeh', 'fmonitorh',
+        'fstrobeo', 'fmonitoro', 'swrite', 'sformat', 'swriteb', 'sformatf',
+        'swriteh', 'fgetc', 'swriteo', 'ungetc', 'fscanf', 'fgets', 'fread',
+        'sscanf', 'fseek', 'rewind', 'fflush', 'ftell', 'feof', 'ferror',
+        'readmemb', 'readmemh', 'writememb', 'writememh',
+        'test', 'plusargs', 'value',
+    ]
+
+    FORBIDDEN_WORDS = [
+        "bit", "int", "byte", "shortint", "longint",
+        "real", "shortreal", "time",
+    ]
+
+    BANNED_PATTERNS = [
+        "DPI", "`", "verilator", "xprop_off", "translate_off",
+        "dc_tcl_script_begin", "dc_script_begin",
+    ]
+
+
+class CompiledPatterns:
+    FORBIDDEN_RE = re.compile(
+        r"\b(?:" + "|".join(re.escape(w) for w in SystemVerilogRules.FORBIDDEN_WORDS) + r")\b"
+    )
+    BANNED_RE = re.compile(
+        "|".join(re.escape(p) for p in SystemVerilogRules.BANNED_PATTERNS)
+    )
+    BANNED_SYSTEM_TASKS_RE = re.compile(
+        r"\$(?:" + "|".join(re.escape(t) for t in SystemVerilogRules.BANNED_SYSTEM_TASKS) + r")\b"
+    )
+    LOCAL_ALLOWED_SYSTEM_TASKS_RE = re.compile(
+        r"\$(?:" + "|".join(re.escape(t) for t in SystemVerilogRules.LOCAL_ALLOWED_SYSTEM_TASKS) + r")\b"
+    )
+    ALLOWED_SYSTEM_TASKS_RE = re.compile(
+        r"\$(?:" + "|".join(re.escape(t) for t in SystemVerilogRules.ALLOWED_SYSTEM_TASKS) + r")\b"
+    )
+    ANY_SYSTEM_TASK_RE = re.compile(r"\$[a-zA-Z_][a-zA-Z0-9_]*\b")
+
+    SL_COMMENT_RE = re.compile(r"//.*$")
+    ML_START_RE = re.compile(r"/\*")
+    ML_END_RE = re.compile(r"\*/")
+
+
+def strip_comments(line: str, in_block_comment: bool) -> Tuple[str, bool]:
+    line_wo_sl = CompiledPatterns.SL_COMMENT_RE.sub("", line)
+
+    processed_parts = []
+    i = 0
+    length = len(line_wo_sl)
+
+    while i < length:
+        if in_block_comment:
+            match_end = CompiledPatterns.ML_END_RE.search(line_wo_sl, i)
+            if match_end:
+                in_block_comment = False
+                i = match_end.end()
+            else:
+                break
+        else:
+            match_start = CompiledPatterns.ML_START_RE.search(line_wo_sl, i)
+            if match_start:
+                processed_parts.append(line_wo_sl[i:match_start.start()])
+                in_block_comment = True
+                i = match_start.end()
+            else:
+                processed_parts.append(line_wo_sl[i:])
+                break
+
+    return "".join(processed_parts), in_block_comment
+
+
+def check_line_for_violations(filepath: Path, line_num: int, code_part: str) -> Tuple[bool, bool]:
+    errors_found = False
+    warnings_found = False
+
+    forbidden_match = CompiledPatterns.FORBIDDEN_RE.search(code_part)
+    if forbidden_match:
+        word = forbidden_match.group(0)
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"[cyan]{filepath}:{line_num}:[/cyan] "
+            f"Forbidden word [yellow]'{word}'[/yellow] found"
+        )
+        errors_found = True
+
+    for task_match in CompiledPatterns.ANY_SYSTEM_TASK_RE.finditer(code_part):
+        task = task_match.group(0)
+
+        if CompiledPatterns.ALLOWED_SYSTEM_TASKS_RE.match(task):
+            continue
+
+        if CompiledPatterns.LOCAL_ALLOWED_SYSTEM_TASKS_RE.match(task):
+            print(
+                f"[bold yellow][RULE] WARNING:[/bold yellow] "
+                f"[cyan]{filepath}:{line_num}:[/cyan] "
+                f"Local-only system task [yellow]'{task}'[/yellow] found; "
+                "please remove before submitting to autograder."
+            )
+            warnings_found = True
+            continue
+
+        if CompiledPatterns.BANNED_SYSTEM_TASKS_RE.match(task):
+            print(
+                f"[bold red][RULE] ERROR:[/bold red] "
+                f"[cyan]{filepath}:{line_num}:[/cyan] "
+                f"Banned system task [yellow]'{task}'[/yellow] found"
+            )
+            errors_found = True
+            continue
+
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"[cyan]{filepath}:{line_num}:[/cyan] "
+            f"Disallowed system task [yellow]'{task}'[/yellow] found"
+        )
+        errors_found = True
+
+    return errors_found, warnings_found
+
+
+def check_banned_patterns(filepath: Path, line_num: int, line: str) -> bool:
+    banned_match = CompiledPatterns.BANNED_RE.search(line)
+    if banned_match:
+        pattern = banned_match.group(0)
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"[cyan]{filepath}:{line_num}:[/cyan] "
+            f"Banned pattern [yellow]'{pattern}'[/yellow] found"
+        )
+        return True
+    return False
+
+
+def audit_rtl_files(target, source, env):
+    print(
+        "[bold cyan][RULE] Checking RTL files for forbidden words and banned patterns[/bold cyan]"
+    )
+
+    any_errors = False
+    any_warnings = False
+
+
+    for src in source:
+        filepath = Path(str(src))
+        in_block_comment = False
+
+        if not str(filepath).endswith(".sv"):
+            continue
+
+        try:
+            with filepath.open("r", encoding="utf-8", errors="ignore") as f:
+                for line_num, raw_line in enumerate(f, start=1):
+                    line = raw_line.rstrip("\n")
+
+                    if check_banned_patterns(filepath, line_num, line):
+                        any_errors = True
+
+                    code_part, in_block_comment = strip_comments(line, in_block_comment)
+
+                    if not code_part.strip():
+                        continue
+
+                    line_errors, line_warnings = check_line_for_violations(
+                        filepath, line_num, code_part
+                    )
+                    if line_errors:
+                        any_errors = True
+                    if line_warnings:
+                        any_warnings = True
+
+        except OSError as e:
+            print(
+                f"[bold red][RULE] ERROR:[/bold red] "
+                f"Could not read [cyan]{filepath}[/cyan]: {e}"
+            )
+            any_errors = True
+
+    if any_errors:
+        print(
+            "[bold red][RULE] Linting failed: Forbidden words or banned patterns found[/bold red]"
+        )
+        return 1
+
+    if any_warnings:
+        print("[bold yellow][RULE] Linting passed with warnings[/bold yellow]")
+    else:
+        print(
+            "[bold green][RULE] Linting passed: No forbidden words or banned patterns found[/bold green]"
+        )
+
+    target_file = str(target[0])
+    with open(target_file, 'w') as f:
+        f.write(f"# RTL audit completed\n")
+        f.write(f"# Errors found: {any_errors}\n")
+        f.write(f"# Warnings found: {any_warnings}\n")
+
+    return 0
+
+
+def load_svbuild_config(rtl_root: Path, sim_tb: str) -> Dict[str, any]:
+    svbuild_path = os.path.join(rtl_root, "svbuild.yaml")
+
+    try:
+        with open(svbuild_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"Failed to parse [cyan]{svbuild_path}[/cyan]: {e}"
+        )
+        sys.exit(1)
+
+    if sim_tb not in config:
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"No RTL profile configuration found for '{sim_tb}' in {rtl_root}/svbuild.yaml"
+        )
+        print(f"[bold yellow][AVAILABLE RTL profiles][/bold yellow] {', '.join(config.keys())}")
+        sys.exit(1)
+
+    tb_config = config[sim_tb]
+    if not isinstance(tb_config, dict):
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"'{sim_tb}' key in [cyan]{svbuild_path}[/cyan] must be a dictionary"
+        )
+        sys.exit(1)
+
+    source_dirs = tb_config.get("source_dirs")
+    compile_first = tb_config.get("compile_first", [])
+
+    if not isinstance(compile_first, list):
+        print(
+            f"[bold red][RULE] ERROR:[/bold red] "
+            f"'compile_first' in '{sim_tb}' must be a list"
+        )
+        sys.exit(1)
+
+    if source_dirs is not None:
+        if isinstance(source_dirs, str):
+            source_dirs = [source_dirs]
+        elif not isinstance(source_dirs, list):
+            print(
+                f"[bold red][RULE] ERROR:[/bold red] "
+                f"'source_dirs' in '{sim_tb}' must be a string or list of strings"
+            )
+            sys.exit(1)
+
+    return {"source_dirs": source_dirs, "compile_first": compile_first}
+
+
+def collect_sv_files(rtl_root: Path, source_dirs: List[str]) -> List[str]:
+    if source_dirs is None:
+        return glob(os.path.join(rtl_root, "**/*.sv"), recursive=True)
+
+    sv_files = []
+    for scope_path in source_dirs:
+        full_scope_path = os.path.join(rtl_root, scope_path)
+
+        if not os.path.exists(full_scope_path):
+            print(
+                f"[bold yellow][RULE] WARNING:[/bold yellow] "
+                f"Scope path [cyan]{scope_path}[/cyan] not found under RTL_ROOT"
+            )
+            continue
+
+        if os.path.isdir(full_scope_path):
+            scope_files = glob(os.path.join(full_scope_path, "**/*.sv"), recursive=True)
+            sv_files.extend(scope_files)
+        else:
+            print(
+                f"[bold yellow][RULE] WARNING:[/bold yellow] "
+                f"Scope path [cyan]{scope_path}[/cyan] is not a directory"
+            )
+
+    return sv_files
+
+
+def collect_rtl_sources(rtl_root: Path, sim_tb: str) -> List[str]:
+    build_config = load_svbuild_config(rtl_root, sim_tb)
+    source_dirs = build_config["source_dirs"]
+    compile_first = build_config["compile_first"]
+
+    unordered_sources = collect_sv_files(rtl_root, source_dirs)
+    rtl_sources = []
+
+    for rel_path in compile_first:
+        abs_path = os.path.join(rtl_root, rel_path)
+        if abs_path in unordered_sources:
+            rtl_sources.append(abs_path)
+            unordered_sources.remove(abs_path)
+        else:
+            print(
+                f"[bold yellow][RULE] WARNING:[/bold yellow] "
+                f"Configured file [cyan]{rel_path}[/cyan] not found under RTL_ROOT"
+            )
+
+    rtl_sources.extend(unordered_sources)
+    return rtl_sources
+
+
+rtl_sources = collect_rtl_sources(env["RTL_ROOT"], env["SIM_CFG"]["tb_name"])
+audit_action = Action(audit_rtl_files, cmdstr=None)
+rtl_audit_target = env.Command(
+    target=os.path.join(env["BUILD_ROOT"], "rtl", ".rtl.stamp"),
+    source=[rtl_sources, Value(env["SIM_CFG"])],
+    action=audit_action,
+)
+
+Return("rtl_sources", "rtl_audit_target")

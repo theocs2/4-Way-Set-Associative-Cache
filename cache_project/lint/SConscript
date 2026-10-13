@@ -1,0 +1,168 @@
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Tuple
+
+from rich import print
+from SCons.Script import Action, Glob, Return, Value
+
+from site_scons.library.helpers import run_and_log
+
+Import('env', 'rtl_sources', 'rtl_audit', 'sram_target')
+
+
+class LintConfig:
+    REPORT_PATTERN = "spyglass-1/consolidated_reports/*_lint_lint_turbo_rtl/moresimple_turbo.rpt"
+    SUMMARY_PATTERN = re.compile(
+        r"(\d+)\s+Fatals?,\s+(\d+)\s+Errors?,\s+(\d+)\s+Warnings?",
+        re.IGNORECASE
+    )
+
+
+class LintReportParser:
+    @staticmethod
+    def parse_summary(log_path: str) -> Tuple[int, int, int, bool]:
+        if not os.path.isfile(log_path):
+            print(f"[bold red][LINT] ERROR:[/bold red] Lint log not found at {log_path}")
+            return 0, 0, 0, False
+
+        with open(log_path, "r", errors="ignore") as f:
+            for line in f:
+                match = LintConfig.SUMMARY_PATTERN.search(line)
+                if match:
+                    fatal, error, warning = map(int, match.groups())
+                    return fatal, error, warning, True
+
+        return 0, 0, 0, False
+
+    @staticmethod
+    def locate_and_move_report(lint_output_dir: str) -> bool:
+        report_glob = LintConfig.REPORT_PATTERN
+        rpt_matches = list(Path(lint_output_dir).glob(report_glob))
+
+        if not rpt_matches:
+            print(f"[bold red][LINT] ERROR:[/bold red] moresimple_turbo.rpt not found!")
+            return False
+
+        dest_path = os.path.join(lint_output_dir, "lint.rpt")
+        shutil.move(str(rpt_matches[0]), dest_path)
+        print(f"[bold green][LINT] SUCCESS:[/bold green] Lint report: {dest_path}")
+        return True
+
+
+class LintValidator:
+    @staticmethod
+    def validate_and_stamp(
+        lint_output_dir: str,
+        target,
+        fatal: int,
+        error: int,
+        warning: int
+    ) -> int:
+        log_path = os.path.join(lint_output_dir, 'lint.log')
+
+        if fatal > 0 or error > 0 or warning > 0:
+            print(
+                f"[bold red][LINT] ERROR:[/bold red] "
+                f"Lint found {fatal} fatal errors, {error} errors, and {warning} warnings in {log_path}"
+            )
+            return 1
+
+        print(f"[bold green][LINT] SUCCESS:[/bold green] Lint passed without errors or warnings")
+
+        target_file = str(target[0])
+        with open(target_file, 'w') as f:
+            f.write(f"# Lint completed\n")
+            f.write(f"# Fatal errors found: {fatal}\n")
+            f.write(f"# Errors found: {error}\n")
+            f.write(f"# Warnings found: {warning}\n")
+
+        return 0
+
+
+class FileManager:
+    @staticmethod
+    def prepare_lint_files(env, lint_output_dir: str) -> None:
+        lint_tcl = os.path.join(env['LINT_ROOT'], env['SYN_CFG']['lint_script'])
+        lint_awl = os.path.join(env['LINT_ROOT'], env['SYN_CFG']['lint_awl'])
+        wrappers_tcl = os.path.join(env['SYN_ROOT'], "wrappers.tcl")
+
+        shutil.copy2(wrappers_tcl, lint_output_dir)
+        shutil.copy2(lint_awl, os.path.join(lint_output_dir, 'lint.awl'))
+        shutil.copy2(lint_tcl, os.path.join(lint_output_dir, 'lint.tcl'))
+
+
+def check_lint_results(lint_output_dir: str, target) -> int:
+    log_path = os.path.join(lint_output_dir, 'lint.log')
+
+    fatal, error, warning, found = LintReportParser.parse_summary(log_path)
+
+    if not found:
+        print(f"[bold red][LINT] ERROR:[/bold red] Goal violation summary not found in {log_path}")
+        return 1
+
+    if not LintReportParser.locate_and_move_report(lint_output_dir):
+        return 1
+
+    return LintValidator.validate_and_stamp(lint_output_dir, target, fatal, error, warning)
+
+
+def lint_action(target, source, env):
+    print(f"[bold cyan][LINT] Running lint command[/bold cyan]")
+
+    lint_output_dir = os.path.dirname(str(target[0]))
+
+    local_env = env['ENV'].copy()
+    local_env['DESIGN_TOP'] = env['SYN_CFG']['design_top']
+    local_env['RTL_SOURCES'] = ' '.join([str(s) for s in rtl_sources])
+    local_env['SRAM_LIB'] = ' '.join([str(s) for s in [f.abspath for f in Glob(f"{env['BUILD_ROOT']}/sram/**/*.db")]])
+
+    FileManager.prepare_lint_files(env, lint_output_dir)
+
+    cmd = "sg_shell -licqueue < lint.tcl"
+
+    lint_rc = run_and_log(
+        cmd,
+        log_path=os.path.join(lint_output_dir, 'lint.log'),
+        env=local_env,
+        cwd=lint_output_dir,
+        simple_output=env.get('RAW'),
+    )
+
+    if lint_rc != 0:
+        print(
+            f"[bold red][LINT] ERROR:[/bold red] "
+            f"Lint command failed: {os.path.join(lint_output_dir, 'lint.log')}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"[bold green][LINT] SUCCESS:[/bold green] "
+        f"Lint command finished: {os.path.join(lint_output_dir, 'lint.log')}",
+        file=sys.stderr,
+    )
+
+    return check_lint_results(lint_output_dir, target)
+
+
+_lint_files = [
+    os.path.join(env['LINT_ROOT'], 'lint.tcl'),
+    os.path.join(env['LINT_ROOT'], 'lint.awl'),
+]
+
+if "lint" in set(COMMAND_LINE_TARGETS):
+    lint_output = os.path.join(
+        env['BUILD_ROOT'], 'lint', env['SIM_CFG']['tb_name'], '.lint.stamp'
+    )
+    lint_target = env.Command(
+        lint_output,
+        [_lint_files, rtl_sources, rtl_audit, Value(env["SIM_CFG"]), Value(env["SYN_CFG"]), sram_target],
+        Action(lint_action, cmdstr=None),
+    )
+else:
+    lint_target = None
+
+Return('lint_target')
